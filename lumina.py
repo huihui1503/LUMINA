@@ -3,9 +3,9 @@ from torch.nn import functional as F
 
 
 class LUMINA():
-    def __init__(self, model, tokenizer, kernel, lam):
+    def __init__(self, model, tokenizer, kernel='cosine', lam=0.5):
         self.model = model
-        self.tokenzer = tokenizer
+        self.tokenizer = tokenizer
         self.lam = lam
         if kernel == "cosine":
             self.kernel = self.__cosine_kernel
@@ -22,7 +22,7 @@ class LUMINA():
         ipr = []
         for t in range(T):
             layer_ratio = []
-            max_id = torch.argmax(ans_prob[t]).to("cuda:0")
+            max_id = torch.argmax(ans_prob[t]).to("cuda")
             total_weight = 0
             for l in range(len(hid_prob)):
                 entropy = self.__compute_entropy(hid_prob[l][t])
@@ -72,12 +72,12 @@ class LUMINA():
     
     def __compute_mmd(self, p_prob, q_prob, embedding_layer, k=100, **kernel_kwargs):
         p_top_k_list, p_embed_list = self.__get_topk_embeddings_and_probs(p_prob, k, embedding_layer)
-        q_top_k_list, q_embed_list = self.get_topk_embeddings_and_probs(q_prob, k, embedding_layer)
+        q_top_k_list, q_embed_list = self.__get_topk_embeddings_and_probs(q_prob, k, embedding_layer)
         with torch.no_grad():
             K_pp = torch.stack([p_top_k @ self.kernel(p_embed, p_embed, **kernel_kwargs) @ p_top_k.T for p_top_k, p_embed in zip(p_top_k_list, p_embed_list)])
             K_qq = torch.stack([q_top_k @ self.kernel(q_embed, q_embed, **kernel_kwargs) @ q_top_k.T for q_top_k, q_embed in zip(q_top_k_list, q_embed_list)])
             K_pq = torch.stack([p_top_k @ self.kernel(p_embed, q_embed, **kernel_kwargs) @ q_top_k.T for p_top_k, p_embed, q_top_k, q_embed in zip(p_top_k_list, p_embed_list, q_top_k_list, q_embed_list)])
-        return (K_pp + K_qq - 2 * K_pq)
+        return (K_pp + K_qq - 2 * K_pq).cpu()
     
     def __get_ans(self, logits, input_ids, prefix_ids, hidden_states=None):
         """
@@ -89,12 +89,11 @@ class LUMINA():
         targets = input_ids[:, start:]
         res = (probs.squeeze(0).float(), targets.squeeze(0))
         if hidden_states is not None:
-            res.append([hidden_state[:, start-1:-1, :].squeeze(0) for hidden_state in hidden_states])
+            res += ([hidden_state[:, start-1:-1, :].squeeze(0) for hidden_state in hidden_states], )
         return res
 
     def __build_input(self, prompt, response):
         messages = [
-                    {"role": "system", "content": "You are a helpful assistant."},
                     {"role": "user", "content": prompt[:12000]}
                 ]
         prefix = self.tokenizer.apply_chat_template(
@@ -102,7 +101,7 @@ class LUMINA():
             tokenize=False,
             add_generation_prompt=True
         )
-        input_text = prefix + response
+        input_text = prefix + ' ' + response
         input_ids = self.tokenizer([input_text], return_tensors="pt").input_ids.to("cuda")
         prefix_ids = self.tokenizer([prefix], return_tensors="pt").input_ids.to("cuda")
         return input_ids, prefix_ids
@@ -130,17 +129,19 @@ class LUMINA():
 
         embedding_layer = self.model.get_input_embeddings()  # or any token embedding function
         prob_w_context, answer_ids_w_context, answer_hid_w_context = self.__get_ans(logits_w_context, input_w_context_ids, prefix_w_context_ids, hidden_states_w_context)
-        prob_w_wrong_context, _, _ = self.__get_ans(logits_w_wrong_context, input_w_wrong_context_ids, prefix_w_wrong_context_ids)
+        prob_w_wrong_context, _ = self.__get_ans(logits_w_wrong_context, input_w_wrong_context_ids, prefix_w_wrong_context_ids)
         
         mmd = self.__compute_mmd(prob_w_context, prob_w_wrong_context, embedding_layer, k=100)
 
-        tuned_len_res = []
+        logit_lens_res = []
         with torch.no_grad():
             for l, hid in enumerate(answer_hid_w_context):
-                # lens_logits = tuned_lens(hid.to("cuda:0"), l).float()
-                lens_logits = self.model.lm_head(self.model.model.norm(hid.to("cuda:0"))).float()
-                tuned_len_res.append(F.softmax(lens_logits, dim=-1))
+                if hasattr(self.model.model, 'language_model'):
+                    lens_logits = self.model.lm_head(self.model.model.language_model.norm(hid)).float()
+                else:
+                    lens_logits = self.model.lm_head(self.model.model.norm(hid)).float()
+                logit_lens_res.append(F.softmax(lens_logits, dim=-1))
         
-        ipr = self.__compute_ipr(tuned_len_res, prob_w_context, answer_ids_w_context)
+        ipr = self.__compute_ipr(logit_lens_res, prob_w_context, answer_ids_w_context)
 
-        return self.lam * ipr - (1 - self.lam) * mmd
+        return self.lam * ipr - (1 - self.lam) * mmd, mmd, ipr
