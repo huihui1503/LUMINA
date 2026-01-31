@@ -57,14 +57,44 @@ This is quantified using **Maximum Mean Discrepancy (MMD)** [1], a kernel-based 
 
 
 ```python
+@torch.no_grad()
 def __compute_mmd(self, p_prob, q_prob, embedding_layer, k=100, **kernel_kwargs):
-    p_top_k_list, p_embed_list = self.__get_topk_embeddings_and_probs(p_prob, k, embedding_layer)
-    q_top_k_list, q_embed_list = self.__get_topk_embeddings_and_probs(q_prob, k, embedding_layer)
-    with torch.no_grad():
-        K_pp = torch.stack([p_top_k @ self.kernel(p_embed, p_embed, **kernel_kwargs) @ p_top_k.T for p_top_k, p_embed in zip(p_top_k_list, p_embed_list)])
-        K_qq = torch.stack([q_top_k @ self.kernel(q_embed, q_embed, **kernel_kwargs) @ q_top_k.T for q_top_k, q_embed in zip(q_top_k_list, q_embed_list)])
-        K_pq = torch.stack([p_top_k @ self.kernel(p_embed, q_embed, **kernel_kwargs) @ q_top_k.T for p_top_k, p_embed, q_top_k, q_embed in zip(p_top_k_list, p_embed_list, q_top_k_list, q_embed_list)])
-    return (K_pp + K_qq - 2 * K_pq).cpu()
+    """
+    Compute Maximum Mean Discrepancy using vectorized operations.
+    """
+    # Get top-k for both distributions
+    p_top_k, p_embed = self.__get_topk_embeddings_and_probs(p_prob, k, embedding_layer)
+    q_top_k, q_embed = self.__get_topk_embeddings_and_probs(q_prob, k, embedding_layer)
+    
+    T = p_prob.shape[0]
+    mmd_scores = []
+    
+    # Process in batches to avoid memory issues with very long sequences
+    batch_size = 32
+    for i in range(0, T, batch_size):
+        end_idx = min(i + batch_size, T)
+        
+        # Compute kernel matrices for batch
+        K_pp = torch.stack([
+            p_top_k[t] @ self.kernel(p_embed[t], p_embed[t], **kernel_kwargs) @ p_top_k[t].T
+            for t in range(i, end_idx)
+        ])
+        
+        K_qq = torch.stack([
+            q_top_k[t] @ self.kernel(q_embed[t], q_embed[t], **kernel_kwargs) @ q_top_k[t].T
+            for t in range(i, end_idx)
+        ])
+        
+        K_pq = torch.stack([
+            p_top_k[t] @ self.kernel(p_embed[t], q_embed[t], **kernel_kwargs) @ q_top_k[t].T
+            for t in range(i, end_idx)
+        ])
+        
+        # MMD² = E[k(p,p)] + E[k(q,q)] - 2E[k(p,q)]
+        mmd_batch = K_pp + K_qq - 2 * K_pq
+        mmd_scores.append(mmd_batch)
+    
+    return torch.cat(mmd_scores).cpu()
 ```
 
 - `p_prob`: Token probabilities when the model sees the **correct retrieved documents**
@@ -81,13 +111,14 @@ The internal knowledge score tracks how the model's predictions evolve across tr
 
 ```python
 logit_lens_res = []
-with torch.no_grad():
-    for l, hid in enumerate(answer_hid_w_context):
-        if hasattr(self.model.model, 'language_model'):
-            lens_logits = self.model.lm_head(self.model.model.language_model.norm(hid)).float()
-        else:
-            lens_logits = self.model.lm_head(self.model.model.norm(hid)).float()
-        logit_lens_res.append(F.softmax(lens_logits, dim=-1))
+for hid in answer_hid:
+    # Apply final layer norm and project to vocabulary
+    if hasattr(self.model.model, 'language_model'):
+        lens_logits = self.model.lm_head(self.model.model.language_model.norm(hid))
+    else:
+        lens_logits = self.model.lm_head(self.model.model.norm(hid))
+    
+    logit_lens_res.append(F.softmax(lens_logits, dim=-1))
 ```
 
 - For each transformer layer, we take the hidden states and project them into vocabulary space
@@ -97,27 +128,60 @@ with torch.no_grad():
 Then we compute the **Information Processing Rate (IPR)**:
 
 ```python
+@torch.no_grad()
 def __compute_ipr(self, hid_prob, ans_prob, ans_ids):
+    """
+    Compute Information Processing Rate (IPR) efficiently using vectorized operations.
+    """
     T = ans_prob.shape[0]
-    ipr = []
-    for t in range(T):
-        layer_ratio = []
-        max_id = torch.argmax(ans_prob[t]).to("cuda")
-        total_weight = 0
-        for l in range(len(hid_prob)):
-            entropy = self.__compute_entropy(hid_prob[l][t])
-            w = 1.0 / (entropy.item() + 1e-8)
-            l_index = l + 1
-            ratio = 1 - min(hid_prob[l][t][max_id].item() / ans_prob[t][max_id].item(), 1.0)
-            layer_ratio.append(ratio * l_index)
-            total_weight += l_index * w
-        ipr.append(sum(layer_ratio) / total_weight * ans_prob[t][ans_ids[t]].item() / ans_prob[t][max_id].item())
-    return torch.tensor(ipr)
+    num_layers = len(hid_prob)
+    
+    # Stack all layer probabilities: (num_layers, T, vocab_size)
+    hid_prob_stacked = torch.stack(hid_prob)
+    
+    # Get max predictions for each token position: (T,)
+    max_ids = torch.argmax(ans_prob, dim=-1)
+    
+    # Compute entropy for all layers and tokens at once: (num_layers, T)
+    entropy = self.__compute_entropy(hid_prob_stacked)
+    
+    # Compute weights (inverse entropy): (num_layers, T)
+    weights = 1.0 / (entropy + 1e-8)
+    
+    # Layer indices (1-based): (num_layers, 1)
+    layer_indices = torch.arange(1, num_layers + 1, device=self.device).unsqueeze(1)
+    
+    # Extract probabilities for max_ids across all layers: (num_layers, T)
+    batch_indices = torch.arange(T, device=self.device).unsqueeze(0).expand(num_layers, -1)
+    hid_max_probs = hid_prob_stacked[
+        torch.arange(num_layers, device=self.device).unsqueeze(1),
+        batch_indices,
+        max_ids.unsqueeze(0).expand(num_layers, -1)
+    ]
+    ans_max_probs = ans_prob[batch_indices[0], max_ids]  # (T,)
+    
+    # Compute ratios: (num_layers, T)
+    ratios = 1 - torch.clamp(hid_max_probs / ans_max_probs.unsqueeze(0), max=1.0)
+    
+    # Weighted layer ratios: (num_layers, T)
+    weighted_ratios = ratios * layer_indices
+    
+    # Sum over layers and normalize: (T,)
+    total_weighted_ratio = weighted_ratios.sum(dim=0)
+    total_weight = (layer_indices * weights).sum(dim=0)
+    
+    # Extract answer probabilities: (T,)
+    ans_token_probs = ans_prob[batch_indices[0], ans_ids]
+    
+    # Final IPR computation: (T,)
+    ipr = (total_weighted_ratio / total_weight) * (ans_token_probs / ans_max_probs)
+    
+    return ipr.cpu()
 ```
 
 - For each token in the generated answer, we compare predictions at each intermediate layer to the final output layer
 - If the model's prediction doesn't converge until later layers, it suggests the model is adding more information during processing (likely from internal knowledge)
-- We weight deeper layers more heavily (multiplied by `l_index`)
+- We weight deeper layers more heavily (multiplied by `layer_indices`)
 - We weight layers with lower entropy (more confident predictions) more heavily
 - The final IPR score is higher when:
   - Early layer predictions differ significantly from the final prediction
@@ -151,7 +215,7 @@ The formula captures the key insight from the paper that hallucinations occur wh
   title={LUMINA: Detecting Hallucinations in RAG System with Context–Knowledge Signals},
   author={Samuel Yeh and Sharon Li and Tanwi Mallick},
   booktitle={The Fourteenth International Conference on Learning Representations},
-    year={2026},
+  year={2026},
 }
 ```
 
