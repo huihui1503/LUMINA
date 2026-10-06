@@ -31,10 +31,10 @@ class LUMINA():
         num_layers = len(hid_prob)
         
         # Stack all layer probabilities: (num_layers, T, vocab_size)
-        hid_prob_stacked = torch.stack(hid_prob)
+        hid_prob_stacked = torch.stack(hid_prob).to(self.device)
         
         # Get max predictions for each token position: (T,)
-        max_ids = torch.argmax(ans_prob, dim=-1)
+        max_ids = torch.argmax(ans_prob, dim=-1).to(self.device)
         
         # Compute entropy for all layers and tokens at once: (num_layers, T)
         entropy = self.__compute_entropy(hid_prob_stacked)
@@ -52,6 +52,8 @@ class LUMINA():
             batch_indices,
             max_ids.unsqueeze(0).expand(num_layers, -1)
         ]
+
+        ans_prob = ans_prob.to(self.device)
         ans_max_probs = ans_prob[batch_indices[0], max_ids]  # (T,)
         
         # Compute ratios: (num_layers, T)
@@ -225,7 +227,8 @@ class LUMINA():
         # Build inputs
         input_w_context_ids, prefix_w_context_ids = self.__build_input(prompt_w_context, response)
         input_w_random_ids, prefix_w_random_ids = self.__build_input(prompt_w_random_context, response)
-        
+
+        input_w_context_ids = input_w_context_ids.to(self.model.device)
         # Forward pass with correct context
         outputs_w_context = self.model(
             input_ids=input_w_context_ids,
@@ -233,7 +236,8 @@ class LUMINA():
             output_hidden_states=True,
             use_cache=False  # Disable KV cache to save memory
         )
-        
+
+        input_w_random_ids = input_w_random_ids.to(self.model.device)
         # Forward pass with random context
         outputs_w_random = self.model(
             input_ids=input_w_random_ids,
