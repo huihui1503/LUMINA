@@ -28,14 +28,18 @@ def parse_args():
 
     return parser.parse_args()
 
-def read_json(file_path, data_type):
+def read_json(
+        file_path: str, 
+        data_type: str,
+        split: str = "test",
+        ):
     data = []
 
     with open(file_path, "r", encoding="utf-8") as f:
         for line in f:
             data.append(json.loads(line))
 
-    filtered_data = [i for i in data if i["model"] == data_type]
+    filtered_data = [i for i in data if i["model"] == data_type and i["split"] == split]
     return filtered_data
 
 if __name__ == "__main__":
@@ -58,12 +62,7 @@ if __name__ == "__main__":
         print("model name error")
         exit(-1)
 
-    if args.dataset == "dolly":
-        file_path = "datasets/dolly/preprocessed_merged.jsonl"
-    else:
-        print("dataset name error")
-        exit(-1)
-
+    file_path = f"datasets/{args.dataset}/preprocessed_merged.jsonl"
     dataset = read_json(
         file_path=file_path,
         data_type=data_type
@@ -73,10 +72,14 @@ if __name__ == "__main__":
         llm_model_name,
         torch_dtype=torch.float32
     ).to("cuda")
-    
+
     tokenizer = AutoTokenizer.from_pretrained(llm_model_name)
     
-    detector = LUMINA(model, tokenizer)
+    detector = LUMINA(
+        model = model, 
+        tokenizer = tokenizer,
+        device = "cuda"
+        )
 
     labels = []
     scores = []
@@ -85,7 +88,6 @@ if __name__ == "__main__":
         prompt_w_random_context = i["prompt_w_random_context"]
         response = i["response"]
 
-        start = time.time()
         # Returns (hallucination_score, mmd, ipr)
         hallucination_score, mmd, ipr = detector.predict(
             prompt_w_context, 
@@ -96,9 +98,6 @@ if __name__ == "__main__":
         labels.append(i["labels"])
         scores.append(hallucination_score.mean())
 
-        end = time.time()
-        print(f"Running time: {end - start:.4f} seconds")
-
     y_true = np.array(labels)
     y_score = torch.stack(scores).cpu().numpy()
     auroc = roc_auc_score(y_true, y_score)
@@ -107,6 +106,6 @@ if __name__ == "__main__":
 
 
 
-    np.save(f"logs/{data_type}_{dataset}.npy", y_score)
+    np.save(f"logs/{data_type}_{args.dataset}.npy", y_score)
 
 
